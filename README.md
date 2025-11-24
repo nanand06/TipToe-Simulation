@@ -64,6 +64,7 @@ The backend will:
 - Initialize 20 sample documents
 - Compute embeddings (downloads model ~80MB on first run)
 - Cluster documents into 10 clusters
+- Save data to `backend/data/` folder (created automatically)
 - Start server on `http://localhost:8000`
 
 ### 2. Frontend Setup
@@ -110,7 +111,8 @@ The Tiptoe protocol ensures:
 1. **Initialization**:
    - Embeds all documents using sentence transformers
    - Clusters documents using K-means
-   - Stores embeddings and cluster assignments
+   - Stores embeddings and cluster assignments in `backend/data/` folder
+   - On subsequent runs, loads cached data from `backend/data/` for faster startup
 
 2. **PIR Processing**:
    - Receives encrypted query (never sees plaintext)
@@ -132,6 +134,9 @@ my-app/
 ├── backend/
 │   ├── main.py           # FastAPI server with PIR protocol
 │   ├── requirements.txt  # Python dependencies
+│   ├── data/             # Data folder (created automatically)
+│   │   ├── documents.pkl # Cached document embeddings
+│   │   └── clusters.pkl  # Cached cluster data
 │   └── README.md         # Backend documentation
 └── README.md             # This file
 ```
@@ -196,6 +201,16 @@ For a production system:
    - Batch processing
    - Parallel computation
    - CDN for static assets
+
+## 🚀 Deployment
+
+See [DEPLOYMENT.md](./DEPLOYMENT.md) for detailed deployment instructions.
+
+**Quick Deploy:**
+- **Frontend**: Deploy to Vercel (recommended for Next.js)
+- **Backend**: Deploy to Railway, Render, or Fly.io
+
+The frontend uses environment variable `NEXT_PUBLIC_API_URL` to connect to the backend.
 
 ## 📝 License
 

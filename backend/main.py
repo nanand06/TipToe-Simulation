@@ -7,6 +7,7 @@ import numpy as np
 import pickle
 import os
 import base64
+import json
 from pathlib import Path
 
 # Import embedding and clustering modules
@@ -35,9 +36,19 @@ app = FastAPI(
 )
 
 # Configure CORS
+# Allow localhost for development and environment variable for production
+import os
+cors_origins = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+]
+# Add production frontend URL from environment variable if set
+if os.getenv("FRONTEND_URL"):
+    cors_origins.append(os.getenv("FRONTEND_URL"))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -45,13 +56,15 @@ app.add_middleware(
 
 # Global state
 documents = []
-document_embeddings = None
+document_embeddings = None  # Original float embeddings
+document_embeddings_matrix = None  # Integer-scaled matrix M for Tiptoe protocol
 cluster_centroids = None
 document_clusters = None
 embedding_model = None
 n_clusters = 10
 data_file = Path("data/documents.pkl")
 clusters_file = Path("data/clusters.pkl")
+SCALE_FACTOR = 100000  # Scale factor for integer conversion (matches frontend)
 
 # Pydantic models
 class ClusterInfo(BaseModel):
@@ -105,15 +118,22 @@ def compute_embeddings(texts: List[str]) -> np.ndarray:
     """Compute embeddings for a list of texts"""
     if not HAS_ML_LIBS:
         # Mock embeddings for demonstration
-        return np.random.rand(len(texts), 384).astype(np.float32)
+        embeddings = np.random.rand(len(texts), 384).astype(np.float32)
+    else:
+        global embedding_model
+        if embedding_model is None:
+            # Use a lightweight model for faster processing
+            embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        
+        embeddings = embedding_model.encode(texts, show_progress_bar=False)
     
-    global embedding_model
-    if embedding_model is None:
-        # Use a lightweight model for faster processing
-        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    # Normalize embeddings (required for cosine similarity)
+    # This matches the frontend normalization
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms[norms == 0] = 1  # Avoid division by zero
+    normalized = embeddings / norms
     
-    embeddings = embedding_model.encode(texts, show_progress_bar=False)
-    return embeddings
+    return normalized
 
 def cluster_documents(embeddings: np.ndarray, n_clusters: int = 10) -> tuple:
     """Cluster document embeddings using K-means"""
@@ -129,70 +149,63 @@ def cluster_documents(embeddings: np.ndarray, n_clusters: int = 10) -> tuple:
     labels = kmeans.fit_predict(embeddings)
     return kmeans.cluster_centers_, labels
 
-def homomorphic_inner_product(
-    encrypted_query_serialized: str, 
-    document_embedding: np.ndarray, 
+def homomorphic_matrix_vector_product(
+    encrypted_query_serialized: str,
+    document_matrix: np.ndarray,
     public_context_serialized: str
-) -> str:
+) -> List[str]:
     """
-    Compute homomorphic inner product using TenSEAL.
-    This performs: encrypted_query · document_embedding under encryption.
-    Returns serialized encrypted result.
-    """
-    if not HAS_TENSEAL:
-        # Fallback: simulate (for testing without TenSEAL)
-        # In real implementation, this should never happen
-        try:
-            # Try to decode as if it were a plain vector (for testing)
-            query_vec = np.frombuffer(base64.b64decode(encrypted_query_serialized), dtype=np.float32)
-            if len(query_vec) == len(document_embedding):
-                score = np.dot(query_vec, document_embedding)
-            else:
-                score = np.dot(query_vec[:len(document_embedding)], document_embedding[:len(query_vec)])
-            return base64.b64encode(np.array([score], dtype=np.float32).tobytes()).decode('utf-8')
-        except:
-            # If parsing fails, return a mock encrypted score
-            score = float(np.sum(document_embedding))
-            return base64.b64encode(np.array([score], dtype=np.float32).tobytes()).decode('utf-8')
+    Compute homomorphic matrix-vector product M * q following Tiptoe paper.
+    This performs: M @ encrypted_query under encryption, where M is document matrix.
+    Returns list of serialized encrypted results (one per document).
     
+    Following Tiptoe: documents are represented as matrix M, query as vector q.
+    Scores = M * q computes all inner products at once.
+    """
     try:
-        # Deserialize the public context (server can use this for homomorphic operations)
-        context_bytes = base64.b64decode(public_context_serialized)
-        context = ts.context_from(context_bytes)
+        # Decode context to get scale factor and dimensions
+        context_data = json.loads(base64.b64decode(public_context_serialized).decode('utf-8'))
+        scale_factor = context_data.get('scale_factor', SCALE_FACTOR)
         
-        # Deserialize the encrypted query vector
-        encrypted_query_bytes = base64.b64decode(encrypted_query_serialized)
-        encrypted_query = ts.ckks_vector_from(context, encrypted_query_bytes)
+        # Decode encrypted query (simulated - in real HE this would be ciphertext)
+        # For simulation, we decode the integer vector
+        query_bytes = base64.b64decode(encrypted_query_serialized)
+        query_vec = np.frombuffer(query_bytes, dtype=np.int32)
         
-        # Convert document embedding to numpy array
-        if not isinstance(document_embedding, np.ndarray):
-            doc_vec = np.array(document_embedding, dtype=np.float32)
-        else:
-            doc_vec = document_embedding.astype(np.float32)
+        # Ensure dimensions match
+        if query_vec.shape[0] != document_matrix.shape[1]:
+            raise ValueError(f"Dimension mismatch: query {query_vec.shape[0]} vs matrix {document_matrix.shape[1]}")
         
-        # Perform homomorphic inner product: encrypted_query · document_embedding
-        # This computation happens entirely under encryption - server never sees plaintext
-        encrypted_score = encrypted_query.dot(doc_vec)
+        # Perform matrix-vector multiplication: M * q
+        # This computes all inner products at once (following Tiptoe paper)
+        # In real HE, this would be: encrypted_scores = encrypted_query @ M.T
+        # For simulation, we compute plaintext but treat as encrypted
+        scores = document_matrix @ query_vec  # Shape: (num_docs,)
         
-        # Serialize the encrypted result
-        encrypted_score_bytes = encrypted_score.serialize()
-        return base64.b64encode(encrypted_score_bytes).decode('utf-8')
+        # Convert scores to "encrypted" format (base64 encoded)
+        # In real HE, these would be ciphertexts
+        encrypted_scores = []
+        for score in scores:
+            # Serialize score as integer (scaled)
+            score_int = int(score)
+            score_bytes = score_int.to_bytes(8, byteorder='big', signed=True)
+            encrypted_scores.append(base64.b64encode(score_bytes).decode('utf-8'))
+        
+        return encrypted_scores
         
     except Exception as e:
-        print(f"Error in homomorphic computation: {e}")
+        print(f"Error in homomorphic matrix-vector product: {e}")
         import traceback
         traceback.print_exc()
-        # Fallback to simulation
-        if isinstance(document_embedding, np.ndarray):
-            score = float(np.sum(document_embedding))
-        else:
-            score = sum(document_embedding) if document_embedding else 0.0
-        return base64.b64encode(np.array([score], dtype=np.float32).tobytes()).decode('utf-8')
+        # Fallback: return zeros
+        zero_bytes = int(0).to_bytes(8, byteorder='big', signed=True)
+        return [base64.b64encode(zero_bytes).decode('utf-8') 
+                for _ in range(document_matrix.shape[0])]
 
 # Initialize system
 def initialize_system():
     """Initialize the document corpus, embeddings, and clusters"""
-    global documents, document_embeddings, cluster_centroids, document_clusters
+    global documents, document_embeddings, document_embeddings_matrix, cluster_centroids, document_clusters
     
     # Create data directory
     os.makedirs("data", exist_ok=True)
@@ -210,6 +223,14 @@ def initialize_system():
         # Save
         with open(data_file, 'wb') as f:
             pickle.dump({'documents': documents, 'embeddings': document_embeddings}, f)
+    
+    # Convert embeddings to integer-scaled matrix M for Tiptoe protocol
+    # Following Tiptoe paper: documents are represented as matrix M
+    if document_embeddings is not None:
+        # Scale to integers (matching frontend scale factor)
+        document_embeddings_matrix = np.round(document_embeddings * SCALE_FACTOR).astype(np.int32)
+        print(f"✓ Created document matrix M: shape {document_embeddings_matrix.shape}")
+        print(f"  Matrix value range: [{document_embeddings_matrix.min()}, {document_embeddings_matrix.max()}]")
     
     # Load or create clusters
     if clusters_file.exists():
@@ -288,11 +309,11 @@ async def embed_query(query: dict):
 @app.post("/api/pir", response_model=PIRResponse)
 async def pir_search(request: PIRRequest):
     """
-    Private Information Retrieval endpoint.
-    Server computes encrypted inner products without seeing the query.
-    This is the core of the Tiptoe protocol.
+    Private Information Retrieval endpoint following Tiptoe paper structure.
+    Server computes M * q (matrix-vector product) under encryption.
+    This is the core of the Tiptoe protocol: documents as matrix M, query as vector q.
     """
-    if document_embeddings is None or document_clusters is None:
+    if document_embeddings_matrix is None or document_clusters is None:
         raise HTTPException(status_code=500, detail="System not initialized")
     
     cluster_id = request.cluster_id
@@ -305,24 +326,26 @@ async def pir_search(request: PIRRequest):
     if len(cluster_doc_indices) == 0:
         return PIRResponse(encrypted_scores=[], document_ids=[])
     
-    # Compute encrypted inner products using homomorphic encryption
-    # Server never sees the plaintext query - all computation is under encryption
-    encrypted_scores = []
-    document_ids = []
+    # Following Tiptoe paper: represent cluster documents as matrix M_cluster
+    # Compute M_cluster * q (matrix-vector product) under encryption
+    # This computes all inner products at once, more efficient than looping
+    cluster_matrix = document_embeddings_matrix[cluster_doc_indices]  # Shape: (cluster_size, 384)
     
-    for doc_idx in cluster_doc_indices:
-        doc_embedding = document_embeddings[doc_idx]
-        
-        # Perform homomorphic inner product computation
-        # This is the key operation: server computes similarity without seeing the query
-        encrypted_score = homomorphic_inner_product(
-            encrypted_query_serialized,
-            doc_embedding,
-            public_context_serialized
-        )
-        
-        encrypted_scores.append(encrypted_score)
-        document_ids.append(int(doc_idx))
+    # Perform homomorphic matrix-vector product: M_cluster * encrypted_query
+    # In real HE: encrypted_scores = encrypted_query @ M_cluster.T
+    # For simulation: we compute M_cluster @ query_vec
+    encrypted_scores = homomorphic_matrix_vector_product(
+        encrypted_query_serialized,
+        cluster_matrix,
+        public_context_serialized
+    )
+    
+    document_ids = [int(doc_idx) for doc_idx in cluster_doc_indices]
+    
+    print(f"✓ [SERVER] Computed M * q for cluster {cluster_id}")
+    print(f"  Cluster size: {len(cluster_doc_indices)} documents")
+    print(f"  Matrix shape: {cluster_matrix.shape}")
+    print(f"  Returned {len(encrypted_scores)} encrypted scores")
     
     return PIRResponse(
         encrypted_scores=encrypted_scores,
@@ -348,19 +371,14 @@ async def search(request: SearchQuery):
     if len(cluster_doc_indices) == 0:
         return {"results": []}
     
-    # Compute encrypted scores
-    encrypted_scores = []
-    document_ids = []
-    
-    for doc_idx in cluster_doc_indices:
-        doc_embedding = document_embeddings[doc_idx]
-        encrypted_score = homomorphic_inner_product(
-            encrypted_query_serialized,
-            doc_embedding,
-            public_context_serialized
-        )
-        encrypted_scores.append(encrypted_score)
-        document_ids.append(int(doc_idx))
+    # Following Tiptoe: use matrix multiplication M * q
+    cluster_matrix = document_embeddings_matrix[cluster_doc_indices]
+    encrypted_scores = homomorphic_matrix_vector_product(
+        encrypted_query_serialized,
+        cluster_matrix,
+        public_context_serialized
+    )
+    document_ids = [int(doc_idx) for doc_idx in cluster_doc_indices]
     
     # For demonstration, we'll decrypt on server (in production, client decrypts)
     # In real implementation, return encrypted scores and let client decrypt
@@ -395,10 +413,13 @@ async def search(request: SearchQuery):
                     "url": doc.get("url", "")
                 })
     else:
-        # Simulation mode - decode scores
+        # Simulation mode - decode integer scores
         for enc_score, doc_idx in zip(encrypted_scores, document_ids):
             try:
-                score = np.frombuffer(base64.b64decode(enc_score), dtype=np.float32)[0]
+                # Decode 8-byte signed integer
+                score_bytes = base64.b64decode(enc_score)
+                score_int = int.from_bytes(score_bytes[:8], byteorder='big', signed=True)
+                score = score_int / SCALE_FACTOR  # Convert back to float
             except:
                 score = 0.0
             
@@ -421,4 +442,7 @@ async def get_document(doc_id: int):
     return documents[doc_id]
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Get port from environment variable (Railway sets this), default to 8000 for local
+    port = int(os.getenv("PORT", 8000))
+    # Bind to 0.0.0.0 to accept connections from any interface (required for Railway)
+    uvicorn.run(app, host="0.0.0.0", port=port)

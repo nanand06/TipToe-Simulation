@@ -26,7 +26,8 @@ export default function Home() {
   const [showPrivacyInfo, setShowPrivacyInfo] = useState(false);
   const [heContext, setHeContext] = useState<any>(null); // For storing HE context
   const [mounted, setMounted] = useState(false); // Track if component is mounted
-  const API_BASE = "http://localhost:8000";
+  // Use environment variable for API URL, fallback to localhost for development
+  const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
   // Initialize: Fetch cluster centroids and store client-side
   useEffect(() => {
@@ -39,8 +40,8 @@ export default function Home() {
   }, []);
 
   // Generate mock embedding client-side using random numbers
-  // This avoids all dependency issues and works immediately
-  // Note: This is a mock - in production you'd use a real embedding model
+  // Matches backend embedding range and converts to integers for HE simulation
+  // Following Tiptoe paper structure: embeddings are normalized vectors
   const generateEmbedding = async (text: string): Promise<number[]> => {
     // Generate random embedding of 384 dimensions (matching backend model)
     // Use text as seed for deterministic randomness (same query = same embedding)
@@ -57,20 +58,31 @@ export default function Home() {
       return seed / 233280;
     };
     
-    // Generate 384 random values between -1 and 1
+    // Generate 384 random values matching sentence transformer range
+    // Sentence transformers (all-MiniLM-L6-v2) typically produce values roughly in [-1, 1] range
+    // but after normalization, values are typically in a tighter range
     for (let i = 0; i < 384; i++) {
       embedding.push((seededRandom() * 2) - 1);
     }
     
     // Normalize the embedding (cosine similarity requires normalized vectors)
+    // This matches how backend embeddings are normalized
     const magnitude = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
     const normalized = embedding.map(val => val / magnitude);
     
-    console.log("✓ [CLIENT] Generated mock embedding client-side (server never saw query)");
-    console.log(`  Embedding dimension: ${normalized.length}`);
-    console.log(`  Note: Using mock embeddings (random numbers seeded by query text)`);
+    // Convert to integers by scaling (for homomorphic encryption simulation)
+    // Scale by 100000 to preserve precision when converting to integers
+    // This matches Tiptoe's approach of using integer-based HE schemes
+    const SCALE_FACTOR = 100000;
+    const integerEmbedding = normalized.map(val => Math.round(val * SCALE_FACTOR));
     
-    return normalized;
+    console.log("✓ [CLIENT] Generated mock embedding client-side (server never saw query)");
+    console.log(`  Embedding dimension: ${integerEmbedding.length}`);
+    console.log(`  Original range: [${Math.min(...normalized).toFixed(4)}, ${Math.max(...normalized).toFixed(4)}]`);
+    console.log(`  Integer range: [${Math.min(...integerEmbedding)}, ${Math.max(...integerEmbedding)}]`);
+    console.log(`  Note: Converted to integers for HE simulation (scaled by ${SCALE_FACTOR})`);
+    
+    return integerEmbedding;
   };
 
   // Initialize homomorphic encryption context (simulated)
@@ -96,25 +108,31 @@ export default function Home() {
     }
   };
 
-  // Encrypt query vector using homomorphic encryption
+  // Encrypt query vector using homomorphic encryption (simulated)
+  // Following Tiptoe paper: query is encrypted before sending to server
   const encryptQuery = async (queryEmbedding: number[]): Promise<{ encrypted: string; context: string }> => {
     // In a real implementation, this would use actual HE (e.g., TenSEAL via WASM)
-    // For now, we simulate by encoding the vector
-    // The server will treat this as encrypted data
+    // For simulation, we encode the integer vector as base64
+    // The server will treat this as encrypted data and perform M * q under encryption
     
-    // Simulate encryption: encode the vector as base64
-    // In production, this would be actual ciphertext
-    const encoder = new TextEncoder();
-    const floatArray = new Float32Array(queryEmbedding);
-    const buffer = floatArray.buffer;
+    // Simulate encryption: encode the integer vector as base64
+    // In production, this would be actual ciphertext from HE scheme
+    const int32Array = new Int32Array(queryEmbedding);
+    const buffer = int32Array.buffer;
     const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
     
     // Simulate public context (in real HE, this would be the public key/context)
-    const contextBase64 = btoa(JSON.stringify({ mode: "simulated", dim: queryEmbedding.length }));
+    // Include scale factor so server knows how to handle the integers
+    const contextBase64 = btoa(JSON.stringify({ 
+      mode: "simulated", 
+      dim: queryEmbedding.length,
+      scale_factor: 100000,
+      data_type: "int32"
+    }));
     
     // Log the encrypted query
     console.log("🔐 [CLIENT] Query Encryption (Client-Side):");
-    console.log("  Original query embedding (first 5 values):", queryEmbedding.slice(0, 5));
+    console.log("  Query embedding (first 5 integers):", queryEmbedding.slice(0, 5));
     console.log("  Encrypted query (base64):", base64.substring(0, 100) + "...");
     console.log("  Encrypted query length:", base64.length, "characters");
     console.log("  Public context (base64):", contextBase64);
@@ -126,10 +144,15 @@ export default function Home() {
   };
 
   // Find nearest cluster based on query embedding (client-side)
+  // Query embedding is in integer form, centroids are floats - need to convert for comparison
   const findNearestCluster = (queryEmbedding: number[]): number => {
     if (clusters.length === 0) {
       return 0;
     }
+
+    // Convert integer query embedding back to float for similarity computation
+    const SCALE_FACTOR = 100000;
+    const queryFloat = queryEmbedding.map(val => val / SCALE_FACTOR);
 
     let maxSimilarity = -1;
     let nearestCluster = 0;
@@ -137,16 +160,16 @@ export default function Home() {
 
     for (const cluster of clusters) {
       const centroid = cluster.centroid;
-      if (centroid.length !== queryEmbedding.length) continue;
+      if (centroid.length !== queryFloat.length) continue;
 
-      // Compute cosine similarity
+      // Compute cosine similarity (both vectors should be normalized)
       let dotProduct = 0;
       let magnitudeA = 0;
       let magnitudeB = 0;
 
-      for (let i = 0; i < queryEmbedding.length; i++) {
-        dotProduct += queryEmbedding[i] * centroid[i];
-        magnitudeA += queryEmbedding[i] * queryEmbedding[i];
+      for (let i = 0; i < queryFloat.length; i++) {
+        dotProduct += queryFloat[i] * centroid[i];
+        magnitudeA += queryFloat[i] * queryFloat[i];
         magnitudeB += centroid[i] * centroid[i];
       }
 
@@ -161,7 +184,7 @@ export default function Home() {
 
     // Log the chosen cluster
     console.log("🔍 [CLIENT] Cluster Selection (Client-Side):");
-    console.log("  Query embedding dimension:", queryEmbedding.length);
+    console.log("  Query embedding dimension:", queryFloat.length);
     console.log("  Chosen cluster:", nearestCluster);
     console.log("  Max similarity:", maxSimilarity.toFixed(4));
     console.log("  All cluster similarities:", similarities.map(s => 
@@ -173,18 +196,25 @@ export default function Home() {
   };
 
   // Decrypt encrypted scores (client-side)
+  // Following Tiptoe: scores are integers that need to be scaled back
   const decryptScores = (encryptedScores: string[]): number[] => {
-    // In a real implementation, this would use the secret key to decrypt
-    // For simulation, we decode the base64
+    // In a real implementation, this would use the secret key to decrypt HE ciphertexts
+    // For simulation, we decode the base64-encoded integers
+    const SCALE_FACTOR = 100000;
     return encryptedScores.map(enc => {
       try {
         const decoded = atob(enc);
-        const buffer = new Uint8Array(decoded.length);
-        for (let i = 0; i < decoded.length; i++) {
-          buffer[i] = decoded.charCodeAt(i);
+        // Read as 8-byte signed integer (big-endian)
+        let scoreInt = 0;
+        for (let i = 0; i < Math.min(8, decoded.length); i++) {
+          scoreInt = (scoreInt << 8) | decoded.charCodeAt(i);
         }
-        const floatArray = new Float32Array(buffer.buffer);
-        return floatArray[0] || 0;
+        // Handle sign extension for negative numbers
+        if (scoreInt & 0x8000000000000000) {
+          scoreInt = scoreInt - 0x10000000000000000;
+        }
+        // Convert back to float by dividing by scale factor
+        return scoreInt / SCALE_FACTOR;
       } catch {
         return 0;
       }
@@ -352,7 +382,7 @@ export default function Home() {
             />
             <button
               onClick={handleSearch}
-              disabled={loading || !query.trim()}
+              
               className="px-6 py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-zinc-400 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors"
             >
               {loading ? "Searching..." : "Search"}
