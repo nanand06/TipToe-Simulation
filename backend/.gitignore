@@ -34,3 +34,6 @@ wheels/
 .env
 .env.local
 
+# Data folder (generated files)
+data/
+
