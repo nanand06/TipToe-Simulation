@@ -43,8 +43,13 @@ cors_origins = [
     "http://localhost:3001",
 ]
 # Add production frontend URL from environment variable if set
-if os.getenv("FRONTEND_URL"):
-    cors_origins.append(os.getenv("FRONTEND_URL"))
+frontend_url = os.getenv("FRONTEND_URL")
+if frontend_url:
+    cors_origins.append(frontend_url)
+    # Also add without trailing slash if present
+    if frontend_url.endswith('/'):
+        cors_origins.append(frontend_url.rstrip('/'))
+    print(f"✓ Added frontend URL to CORS: {frontend_url}")
 
 app.add_middleware(
     CORSMiddleware,
